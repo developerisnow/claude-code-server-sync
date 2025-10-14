@@ -1,0 +1,9 @@
+# User-specific config (contains private paths)
+config.json
+
+# Temp sync directory
+/tmp/claude-sync/
+
+# Logs
+*.log
+*.jsonl
