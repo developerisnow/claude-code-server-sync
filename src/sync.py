@@ -1,383 +1,408 @@
 #!/usr/bin/env python3
-"""
-Claude Code Server Sync Tool
-Syncs .jsonl files between server and macOS with path transformation
-"""
+"""Simple rsync-based synchronizer for Claude Code projects."""
 
+from __future__ import annotations
+
+import argparse
 import json
-import re
+import posixpath
+import shlex
+import shutil
 import subprocess
 import sys
-import os
+import tempfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, Iterator, List, Sequence, Tuple
 
-SCRIPT_DIR = Path(__file__).parent.parent
-CONFIG_FILE = SCRIPT_DIR / "config.json"
-CONFIG_EXAMPLE = SCRIPT_DIR / "examples" / "config.example.json"
-TEMP_DIR = "/tmp/claude-sync"
-
-
-def load_config() -> Dict:
-    """Load configuration from config.json or config.example.json"""
-    if CONFIG_FILE.exists():
-        with open(CONFIG_FILE) as f:
-            return json.load(f)
-    elif CONFIG_EXAMPLE.exists():
-        print(f"⚠️  Using config.example.json. Copy to {CONFIG_FILE} to customize.")
-        with open(CONFIG_EXAMPLE) as f:
-            return json.load(f)
-    else:
-        print("❌ No config file found. Run 'sync.py setup' to create one")
-        sys.exit(1)
+SCRIPT_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = SCRIPT_ROOT / "config.json"
+EXAMPLE_CONFIG = SCRIPT_ROOT / "examples" / "config.example.json"
+VALID_MODES = {"pull", "push", "both"}
 
 
-def get_project_by_name(config: Dict, name: str) -> Dict:
-    """Find project configuration by name"""
-    for project in config["projects"]:
-        if project["name"] == name and project.get("enabled", True):
-            return project
-    print(f"❌ Project '{name}' not found or disabled")
-    sys.exit(1)
+class SyncConfigError(RuntimeError):
+    """Raised when the config file is missing or invalid."""
 
 
-def build_replacements(config: Dict, direction: str) -> List[Tuple[str, str]]:
-    """Build path replacement patterns based on sync direction"""
+def load_config(config_path: Path) -> Dict:
+    """Load config.json or fall back to the example configuration."""
+    candidates: Sequence[Path] = [
+        config_path.expanduser(),
+        DEFAULT_CONFIG,
+        EXAMPLE_CONFIG,
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            with candidate.open("r", encoding="utf-8") as handle:
+                config = json.load(handle)
+            validate_config(config)
+            if candidate == EXAMPLE_CONFIG:
+                print(
+                    "⚠️  Using examples/config.example.json. "
+                    "Copy it to config.json to customise projects.",
+                    file=sys.stderr,
+                )
+            return config
+
+    raise SyncConfigError(
+        "No config.json found. Copy examples/config.example.json and update it."
+    )
+
+
+def validate_config(config: Dict) -> None:
+    """Validate the minimal schema we rely on."""
+    for key in ("ssh_alias", "paths", "projects"):
+        if key not in config:
+            raise SyncConfigError(f"Missing top-level key '{key}' in config.")
+
     paths = config["paths"]
+    for key in ("macos_root", "server_root"):
+        if key not in paths:
+            raise SyncConfigError(f"Missing paths.{key} in config.")
 
-    if direction == "server-to-mac":
-        return [
-            # Escaped paths (project names)
-            (paths["server"]["temp_escaped"], paths["macos"]["temp_escaped"]),
-            # Absolute paths
-            (paths["server"]["temp_base"], paths["macos"]["temp_base"]),
-            (paths["server"]["claude_projects"], paths["macos"]["claude_projects"]),
-        ]
-    else:  # mac-to-server
-        return [
-            # Escaped paths (project names)
-            (paths["macos"]["temp_escaped"], paths["server"]["temp_escaped"]),
-            # Absolute paths
-            (paths["macos"]["temp_base"], paths["server"]["temp_base"]),
-            (paths["macos"]["claude_projects"], paths["server"]["claude_projects"]),
-        ]
+    projects = config["projects"]
+    if not isinstance(projects, list) or not projects:
+        raise SyncConfigError("config.projects must contain at least one project.")
+
+    seen_names = set()
+    for project in projects:
+        for required in ("name", "server_dir", "macos_dir"):
+            if required not in project:
+                raise SyncConfigError(
+                    f"Project entry is missing '{required}': {project!r}"
+                )
+
+        mode = project.get("mode", "pull")
+        if mode not in VALID_MODES:
+            raise SyncConfigError(
+                f"Invalid mode '{mode}' for project '{project['name']}'. "
+                "Use pull, push or both."
+            )
+
+        if project["name"] in seen_names:
+            raise SyncConfigError(f"Duplicate project name '{project['name']}'.")
+        seen_names.add(project["name"])
+
+    for rule in config.get("rewrite_rules", []):
+        if "server" not in rule or "mac" not in rule:
+            raise SyncConfigError(
+                f"rewrite_rules entries require 'server' and 'mac': {rule!r}"
+            )
 
 
-def transform_jsonl_content(content: str, replacements: List[Tuple[str, str]]) -> str:
-    """Transform paths in JSONL content"""
-    result = content
-    for old_path, new_path in replacements:
-        # Escape special regex characters
-        old_escaped = re.escape(old_path)
-        result = re.sub(old_escaped, new_path, result)
-    return result
+def find_project(config: Dict, name: str) -> Dict:
+    """Return a project dict by name."""
+    for project in config["projects"]:
+        if project["name"] == name:
+            return project
+    raise SyncConfigError(f"Project '{name}' not found in config.")
 
 
-def sync_pull(config: Dict, project: Dict):
-    """Pull project from server to macOS"""
-    print(f"📥 Pulling '{project['name']}' from server...")
+def project_paths(config: Dict, project: Dict) -> Tuple[Path, str]:
+    """Return (local_path, server_path) for the project."""
+    mac_root = Path(config["paths"]["macos_root"]).expanduser()
+    server_root = config["paths"]["server_root"].rstrip("/")
 
-    ssh_alias = config["ssh_alias"]
-    server_path = f"{config['paths']['server']['claude_projects']}/{project['server_dir']}"
-    local_path = f"{config['paths']['macos']['claude_projects']}/{project['macos_dir']}"
+    mac_path = mac_root / project["macos_dir"]
+    server_path = posixpath.join(server_root, project["server_dir"].lstrip("/"))
 
-    # Create temp directory
-    temp_dir = f"{TEMP_DIR}/{project['name']}"
-    os.makedirs(temp_dir, exist_ok=True)
+    return mac_path, server_path
 
-    # Step 1: rsync from server to temp
-    print(f"  → rsync {ssh_alias}:{server_path}")
-    cmd = ["rsync", "-avz", f"{ssh_alias}:{server_path}/", temp_dir]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+
+def iter_rules(
+    rules: Iterable[Dict[str, str]], direction: str
+) -> Iterator[Tuple[str, str]]:
+    """Yield (source, destination) tuples sorted by source length."""
+    if direction not in {"server_to_mac", "mac_to_server"}:
+        raise ValueError(f"Unknown direction: {direction}")
+
+    source_key = "server" if direction == "server_to_mac" else "mac"
+    target_key = "mac" if direction == "server_to_mac" else "server"
+
+    sorted_rules = sorted(
+        rules,
+        key=lambda item: len(item.get(source_key, "")),
+        reverse=True,
+    )
+
+    for rule in sorted_rules:
+        source = rule.get(source_key, "")
+        target = rule.get(target_key, "")
+        if not source or not target or source == target:
+            continue
+        yield source, target
+
+
+def apply_rewrites(text: str, rules: Iterable[Dict[str, str]], direction: str) -> str:
+    """Apply rewrite rules to a JSONL string."""
+    updated = text
+    for source, target in iter_rules(rules, direction):
+        updated = updated.replace(source, target)
+    return updated
+
+
+def rewrite_jsonl_files(
+    root: Path, rules: Iterable[Dict[str, str]], direction: str
+) -> int:
+    """Rewrite every *.jsonl file under root. Returns file count."""
+    if not rules:
+        return 0
+
+    count = 0
+    for jsonl_path in root.rglob("*.jsonl"):
+        try:
+            original = jsonl_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            print(f"⚠️  Skipping non-UTF8 file: {jsonl_path}", file=sys.stderr)
+            continue
+
+        transformed = apply_rewrites(original, rules, direction)
+        if transformed != original:
+            jsonl_path.write_text(transformed, encoding="utf-8")
+        count += 1
+
+    return count
+
+
+def with_trailing_slash(value: str) -> str:
+    """Ensure the path ends with a slash for rsync semantics."""
+    return value if value.endswith("/") else f"{value}/"
+
+
+def run_cmd(command: Sequence[str]) -> None:
+    """Run a subprocess and raise on failure."""
+    print("$ " + " ".join(shlex.quote(arg) for arg in command))
+    result = subprocess.run(command, check=False)
     if result.returncode != 0:
-        print(f"❌ rsync failed: {result.stderr}")
-        sys.exit(1)
-
-    # Step 2: Transform paths in all .jsonl files
-    print(f"  → Transforming paths...")
-    replacements = build_replacements(config, "server-to-mac")
-    jsonl_files = list(Path(temp_dir).glob("*.jsonl"))
-
-    for jsonl_file in jsonl_files:
-        with open(jsonl_file, 'r') as f:
-            content = f.read()
-
-        transformed = transform_jsonl_content(content, replacements)
-
-        with open(jsonl_file, 'w') as f:
-            f.write(transformed)
-
-    print(f"  ✓ Transformed {len(jsonl_files)} files")
-
-    # Step 3: Copy to final location
-    os.makedirs(local_path, exist_ok=True)
-    cmd = ["rsync", "-av", f"{temp_dir}/", local_path]
-    subprocess.run(cmd, check=True, capture_output=True)
-
-    print(f"✅ Synced to {local_path}")
+        raise RuntimeError(
+            f"Command failed with exit code {result.returncode}: "
+            f"{' '.join(shlex.quote(arg) for arg in command)}"
+        )
 
 
-def sync_push(config: Dict, project: Dict):
-    """Push project from macOS to server"""
-    if project["sync"] == "server-to-mac":
-        print(f"⚠️  Project '{project['name']}' is configured as read-only (server-to-mac)")
-        confirm = input("Push anyway? (yes/no): ")
-        if confirm.lower() != "yes":
+def pull_project(config: Dict, project: Dict, dry_run: bool = False) -> None:
+    """Sync server → mac for a single project."""
+    mode = project.get("mode", "pull")
+    if mode not in {"pull", "both"}:
+        raise SyncConfigError(
+            f"Project '{project['name']}' is configured as push-only."
+        )
+
+    mac_path, server_path = project_paths(config, project)
+    ssh_alias = config["ssh_alias"]
+
+    mac_path.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"claude-sync-{project['name']}-pull-"))
+    try:
+        remote_src = f"{ssh_alias}:{with_trailing_slash(server_path)}"
+        local_temp = with_trailing_slash(str(temp_dir))
+
+        pull_cmd = ["rsync", "-az", "--delete", remote_src, local_temp]
+        if dry_run:
+            pull_cmd.insert(1, "--dry-run")
+        run_cmd(pull_cmd)
+
+        transformed = rewrite_jsonl_files(
+            temp_dir, config.get("rewrite_rules", []), "server_to_mac"
+        )
+        print(f"→ transformed {transformed} .jsonl file(s)")
+
+        local_dest = with_trailing_slash(str(mac_path))
+        push_cmd = ["rsync", "-a", "--delete", local_temp, local_dest]
+        if dry_run:
+            push_cmd.insert(1, "--dry-run")
+        run_cmd(push_cmd)
+
+        print(f"✓ pull complete: {project['name']} → {mac_path}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def push_project(
+    config: Dict,
+    project: Dict,
+    *,
+    confirm: bool = True,
+    dry_run: bool = False,
+) -> None:
+    """Sync mac → server for a single project."""
+    mode = project.get("mode", "pull")
+    if mode not in {"push", "both"}:
+        raise SyncConfigError(
+            f"Project '{project['name']}' is configured as pull-only."
+        )
+
+    if confirm and not dry_run:
+        response = input(
+            f"Push local changes for '{project['name']}' to the server? [y/N]: "
+        ).strip()
+        if response.lower() not in {"y", "yes"}:
             print("Cancelled.")
             return
 
-    print(f"📤 Pushing '{project['name']}' to server...")
+    mac_path, server_path = project_paths(config, project)
+    if not mac_path.exists():
+        raise SyncConfigError(
+            f"Local directory for '{project['name']}' not found: {mac_path}"
+        )
 
     ssh_alias = config["ssh_alias"]
-    local_path = f"{config['paths']['macos']['claude_projects']}/{project['macos_dir']}"
-    server_path = f"{config['paths']['server']['claude_projects']}/{project['server_dir']}"
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"claude-sync-{project['name']}-push-"))
+    try:
+        local_src = with_trailing_slash(str(mac_path))
+        local_temp = with_trailing_slash(str(temp_dir))
 
-    # Create temp directory
-    temp_dir = f"{TEMP_DIR}/{project['name']}-push"
-    os.makedirs(temp_dir, exist_ok=True)
+        stage_cmd = ["rsync", "-a", "--delete", local_src, local_temp]
+        if dry_run:
+            stage_cmd.insert(1, "--dry-run")
+        run_cmd(stage_cmd)
 
-    # Step 1: Copy local to temp
-    cmd = ["rsync", "-av", f"{local_path}/", temp_dir]
-    subprocess.run(cmd, check=True, capture_output=True)
+        transformed = rewrite_jsonl_files(
+            temp_dir, config.get("rewrite_rules", []), "mac_to_server"
+        )
+        print(f"→ transformed {transformed} .jsonl file(s)")
 
-    # Step 2: Transform paths
-    print(f"  → Transforming paths...")
-    replacements = build_replacements(config, "mac-to-server")
-    jsonl_files = list(Path(temp_dir).glob("*.jsonl"))
+        remote_dest = f"{ssh_alias}:{with_trailing_slash(server_path)}"
+        push_cmd = ["rsync", "-az", "--delete", local_temp, remote_dest]
+        if dry_run:
+            push_cmd.insert(1, "--dry-run")
+        run_cmd(push_cmd)
 
-    for jsonl_file in jsonl_files:
-        with open(jsonl_file, 'r') as f:
-            content = f.read()
-
-        transformed = transform_jsonl_content(content, replacements)
-
-        with open(jsonl_file, 'w') as f:
-            f.write(transformed)
-
-    print(f"  ✓ Transformed {len(jsonl_files)} files")
-
-    # Step 3: rsync to server
-    print(f"  → rsync to {ssh_alias}:{server_path}")
-    cmd = ["rsync", "-avz", f"{temp_dir}/", f"{ssh_alias}:{server_path}"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"❌ rsync failed: {result.stderr}")
-        sys.exit(1)
-
-    print(f"✅ Pushed to server")
+        print(f"✓ push complete: {project['name']} → {remote_dest}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def cmd_list(config: Dict):
-    """List all configured projects"""
-    print("\n📋 Configured Projects:\n")
+def list_projects(config: Dict) -> None:
+    """Print configured projects."""
+    print("Configured projects:")
     for project in config["projects"]:
-        status = "✓" if project.get("enabled", True) else "✗"
-        sync_mode = project["sync"]
-        print(f"  {status} {project['name']:<20} [{sync_mode}]")
-        print(f"    Server: {project['server_dir']}")
-        print(f"    MacOS:  {project['macos_dir']}\n")
+        mode = project.get("mode", "pull")
+        mac_path, server_path = project_paths(config, project)
+        print(f"- {project['name']} [{mode}]")
+        print(f"  server: {server_path}")
+        print(f"  mac:    {mac_path}")
 
 
-def cmd_scan_server(config: Dict):
-    """Scan server for available Claude projects"""
-    print("\n🔍 Scanning server for Claude projects...\n")
+def sync_all(config: Dict, dry_run: bool = False, include_push: bool = False) -> None:
+    """Pull every project configured for pull/both. Optionally push bidirectional ones."""
+    failures: List[Tuple[str, Exception]] = []
 
-    ssh_alias = config["ssh_alias"]
-    server_path = config["paths"]["server"]["claude_projects"]
-
-    cmd = ["ssh", ssh_alias, f"ls -1 {server_path}"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.returncode != 0:
-        print(f"❌ Failed to scan server: {result.stderr}")
-        sys.exit(1)
-
-    projects = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
-
-    print(f"Found {len(projects)} projects on server:\n")
-    for i, project in enumerate(projects, 1):
-        print(f"  {i:2d}. {project}")
-
-    return projects
-
-
-def cmd_scan_local(config: Dict):
-    """Scan local macOS for available Claude projects"""
-    print("\n🔍 Scanning local macOS for Claude projects...\n")
-
-    local_path = Path(config["paths"]["macos"]["claude_projects"])
-
-    if not local_path.exists():
-        print(f"❌ Path not found: {local_path}")
-        sys.exit(1)
-
-    projects = [p.name for p in local_path.iterdir() if p.is_dir() and not p.name.startswith('.')]
-    projects.sort()
-
-    print(f"Found {len(projects)} projects locally:\n")
-    for i, project in enumerate(projects, 1):
-        print(f"  {i:2d}. {project}")
-
-    return projects
-
-
-def cmd_setup():
-    """Interactive setup wizard to create config.json"""
-    print("\n🔧 Claude Code Sync - Setup Wizard\n")
-
-    # Load example config as template
-    if not CONFIG_EXAMPLE.exists():
-        print(f"❌ Example config not found: {CONFIG_EXAMPLE}")
-        sys.exit(1)
-
-    with open(CONFIG_EXAMPLE) as f:
-        config = json.load(f)
-
-    print("Step 1: SSH Configuration")
-    ssh_alias = input(f"  SSH alias [{config['ssh_alias']}]: ").strip() or config['ssh_alias']
-    config['ssh_alias'] = ssh_alias
-
-    # Test SSH connection
-    print(f"\n  Testing connection to {ssh_alias}...")
-    result = subprocess.run(["ssh", ssh_alias, "echo OK"], capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"  ⚠️  SSH test failed. Make sure '{ssh_alias}' is configured in ~/.ssh/config")
-    else:
-        print("  ✓ SSH connection OK")
-
-    print("\nStep 2: Scan Projects")
-    print("\n  Scanning server...")
-    server_projects = cmd_scan_server(config)
-
-    print("\n  Scanning local macOS...")
-    local_projects = cmd_scan_local(config)
-
-    print("\nStep 3: Create Project Mappings")
-    print("  Match server projects to local projects\n")
-
-    config['projects'] = []
-
-    for server_proj in server_projects:
-        print(f"\n→ Server project: {server_proj}")
-        print("  Options:")
-        print("    [s] Skip")
-        print("    [1-N] Match with local project number")
-        print("    [m] Manually enter local project name")
-
-        choice = input("  Choice: ").strip().lower()
-
-        if choice == 's':
+    for project in config["projects"]:
+        if project.get("mode", "pull") not in {"pull", "both"}:
             continue
-        elif choice == 'm':
-            local_proj = input("  Enter local project name: ").strip()
-        elif choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(local_projects):
-                local_proj = local_projects[idx]
-            else:
-                print("  Invalid number, skipping")
+        try:
+            pull_project(config, project, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001 - collect all failures
+            failures.append((project["name"], exc))
+
+    if include_push:
+        for project in config["projects"]:
+            if project.get("mode", "pull") != "both":
                 continue
-        else:
-            print("  Invalid choice, skipping")
-            continue
+            try:
+                push_project(config, project, confirm=False, dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 - collect all failures
+                failures.append((project["name"], exc))
 
-        name = input(f"  Project nickname [{server_proj[:20]}]: ").strip() or server_proj[:20]
-
-        sync_mode = input("  Sync mode (server-to-mac/mac-to-server/bidirectional) [server-to-mac]: ").strip() or "server-to-mac"
-
-        config['projects'].append({
-            "name": name,
-            "server_dir": server_proj,
-            "macos_dir": local_proj,
-            "sync": sync_mode,
-            "enabled": True
-        })
-
-        print(f"  ✓ Added: {name}")
-
-    # Save config
-    print(f"\n💾 Saving config to {CONFIG_FILE}...")
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
-
-    print(f"✅ Config created with {len(config['projects'])} projects")
-    print(f"\nNext steps:")
-    print(f"  1. Review: cat {CONFIG_FILE}")
-    print(f"  2. Test: python3 src/sync.py list")
-    print(f"  3. Pull: python3 src/sync.py pull <project-name>")
+    if failures:
+        print("⚠️  sync-all completed with errors:", file=sys.stderr)
+        for name, exc in failures:
+            print(f"  - {name}: {exc}", file=sys.stderr)
+        raise RuntimeError("sync-all failed for one or more projects.")
 
 
-def cmd_test():
-    """Test path transformation (removed - not needed in production)"""
-    print("❌ Test command removed. Use 'setup' and 'pull' instead.")
-    sys.exit(1)
+def build_parser() -> argparse.ArgumentParser:
+    """Create the CLI parser."""
+    parser = argparse.ArgumentParser(
+        description="Sync Claude Code projects between macOS and server using rsync."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help="Path to config.json (defaults to repo config.json or the example).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Pass --dry-run to rsync commands.",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("list", help="List configured projects.")
+
+    pull_parser = subparsers.add_parser(
+        "pull", help="Pull a project from the server to macOS."
+    )
+    pull_parser.add_argument("project", help="Project name defined in config.json.")
+
+    push_parser = subparsers.add_parser(
+        "push", help="Push a project from macOS to the server."
+    )
+    push_parser.add_argument("project", help="Project name defined in config.json.")
+    push_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt.",
+    )
+
+    sync_all_parser = subparsers.add_parser(
+        "sync-all", help="Pull every project configured for pull/both."
+    )
+    sync_all_parser.add_argument(
+        "--include-push",
+        action="store_true",
+        help="After pulling, also push bidirectional projects.",
+    )
+
+    return parser
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("""
-Claude Code Server Sync
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point used by CLI and tests."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
 
-Usage:
-  sync.py setup                    Interactive setup wizard (first time)
-  sync.py scan server              Scan server for available projects
-  sync.py scan local               Scan local macOS for projects
-  sync.py list                     List configured projects
-  sync.py pull <project-name>      Pull from server → macOS
-  sync.py push <project-name>      Push from macOS → server (manual approve)
+    try:
+        config = load_config(args.config)
+    except SyncConfigError as err:
+        print(f"❌ {err}", file=sys.stderr)
+        return 1
 
-Examples:
-  sync.py setup                    # First-time setup
-  sync.py scan server              # List server projects
-  sync.py list                     # List configured
-  sync.py pull vibe-orchestrator   # Pull project
-        """)
-        sys.exit(1)
+    try:
+        if args.command == "list":
+            list_projects(config)
+        elif args.command == "pull":
+            project = find_project(config, args.project)
+            pull_project(config, project, dry_run=args.dry_run)
+        elif args.command == "push":
+            project = find_project(config, args.project)
+            push_project(
+                config,
+                project,
+                confirm=not (args.yes or args.dry_run),
+                dry_run=args.dry_run,
+            )
+        elif args.command == "sync-all":
+            sync_all(
+                config,
+                dry_run=args.dry_run,
+                include_push=getattr(args, "include_push", False),
+            )
+        else:  # pragma: no cover
+            parser.error("Unknown command.")
+    except SyncConfigError as err:
+        print(f"❌ {err}", file=sys.stderr)
+        return 2
+    except RuntimeError as err:
+        print(f"❌ {err}", file=sys.stderr)
+        return 3
 
-    command = sys.argv[1]
-
-    if command == "setup":
-        cmd_setup()
-
-    elif command == "scan":
-        if len(sys.argv) < 3 or sys.argv[2] not in ['server', 'local']:
-            print("❌ Usage: sync.py scan [server|local]")
-            sys.exit(1)
-
-        config = load_config() if CONFIG_FILE.exists() else json.load(open(CONFIG_EXAMPLE))
-
-        if sys.argv[2] == "server":
-            cmd_scan_server(config)
-        else:
-            cmd_scan_local(config)
-
-    elif command == "list":
-        config = load_config()
-        cmd_list(config)
-
-    elif command == "pull":
-        if len(sys.argv) < 3:
-            print("❌ Usage: sync.py pull <project-name>")
-            sys.exit(1)
-
-        config = load_config()
-        project = get_project_by_name(config, sys.argv[2])
-        sync_pull(config, project)
-
-    elif command == "push":
-        if len(sys.argv) < 3:
-            print("❌ Usage: sync.py push <project-name>")
-            sys.exit(1)
-
-        config = load_config()
-        project = get_project_by_name(config, sys.argv[2])
-        sync_push(config, project)
-
-    else:
-        print(f"❌ Unknown command: {command}")
-        print("Run 'sync.py' without arguments for usage")
-        sys.exit(1)
+    return 0
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    sys.exit(main())

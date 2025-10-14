@@ -1,277 +1,176 @@
 # Claude Code Server Sync
 
-🔄 Синхронизация `.jsonl` сессий между Claude Code на сервере и macOS с автоматической трансформацией путей.
+Быстрый способ держать `.jsonl` сессии Claude Code синхронизированными между macOS и сервером `eywa1`. Вся логика строится на `rsync`, а пути внутри файлов приводятся к нужному формату через простые правила замены.
 
-## 🎯 JTBD (Jobs to be Done)
+---
 
-| Job | Solution |
-|-----|----------|
-| Продолжить серверную сессию локально | `sync.py pull <project>` |
-| Изучить сессии через cprompts/IDE | Автоматическая синхронизация раз в 5 мин |
-| Запушить локальную работу на сервер | `sync.py push <project>` (manual approve) |
+## ⚡️ Quick Start
+- Проверь SSH алиас (в примере — `eywa1`):
 
-## ⚡ Quick Start
+  ```bash
+  ssh eywa1 "echo ok"
+  ```
 
-### 1️⃣ Prerequisite: SSH Setup
+- Создай личный конфиг:
 
-Убедись что работает SSH alias к серверу:
+  ```bash
+  cp examples/config.example.json config.json
+  ```
 
-```bash
-ssh eywa1 "echo Connection OK"
-```
+- Отредактируй `config.json` — пропиши реальные пути и проекты.
+- Пробный прогон, чтобы подтянуть один проект:
 
-Если нет - добавь в `~/.ssh/config`:
+  ```bash
+  python3 src/sync.py pull vibe-orchestrator
+  ```
 
-```
-Host eywa1
-    HostName your.server.ip
-    User user
-    IdentityFile ~/.ssh/id_rsa
-```
+---
 
-### 2️⃣ Interactive Setup (Recommended)
-
-```bash
-# Run setup wizard
-python3 src/sync.py setup
-
-# This will:
-# 1. Test SSH connection
-# 2. Scan server projects
-# 3. Scan local projects
-# 4. Interactive matching
-# 5. Create config.json
-```
-
-### 2️⃣ Alternative: Manual Config
-
-```bash
-# Copy example config
-cp examples/config.example.json config.json
-
-# Edit mappings
-vim config.json
-```
-
-**Config structure:**
+## 🗂 Структура конфига
 
 ```json
 {
   "ssh_alias": "eywa1",
   "paths": {
-    "server": {
-      "claude_projects": "/home/user/.claude/projects",
-      "temp_base": "/var/tmp",
-      "temp_escaped": "-var-tmp"
-    },
-    "macos": {
-      "claude_projects": "/Users/user/.claude/projects",
-      "temp_base": "/private/var/folders/dw/.../T",
-      "temp_escaped": "-private-var-folders-dw-...-T"
-    }
+    "macos_root": "/Users/user/.claude/projects",
+    "server_root": "/home/user/.claude/projects"
   },
+  "rewrite_rules": [
+    { "server": "/home/user/.claude/projects", "mac": "/Users/user/.claude/projects" },
+    { "server": "-var-tmp", "mac": "-private-var-folders-dw-...-T" },
+    { "server": "-home-user---Repositories-", "mac": "-Users-user---Repositories-" }
+  ],
   "projects": [
     {
       "name": "vibe-orchestrator",
       "server_dir": "-var-tmp-vibe-kanban-worktrees-vk-2bd7-run-orch-n",
-      "macos_dir": "-private-var-folders-...-vk-2bd7-run-orch-n",
-      "sync": "server-to-mac",
-      "enabled": true
+      "macos_dir": "-private-var-folders-dw-...-vk-2bd7-run-orch-n",
+      "mode": "pull"
+    },
+    {
+      "name": "memory-monorepo",
+      "server_dir": "-home-user---Repositories-memory-monorepo",
+      "macos_dir": "-Users-user---Repositories-LLMs-memory--developerisnow",
+      "mode": "both"
     }
   ]
 }
 ```
 
-### 3️⃣ Verify Setup
-
-```bash
-# List configured projects
-python3 src/sync.py list
-
-# Scan available projects anytime
-python3 src/sync.py scan server
-python3 src/sync.py scan local
-```
-
-### 4️⃣ Sync Operations
-
-```bash
-# Pull from server
-python3 src/sync.py pull vibe-orchestrator
-
-# Push to server (asks confirmation)
-python3 src/sync.py push memory-monorepo
-```
-
-## 🤖 Automatic Sync (macOS LaunchAgent)
-
-### Setup Scheduler
-
-Create `~/Library/LaunchAgents/com.claude.sync.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.claude.sync</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/user/__Repositories/LLMs-claude-code-exporter/scripts/claude-code-sync/sync-all.sh</string>
-    </array>
-
-    <key>StartInterval</key>
-    <integer>300</integer> <!-- 5 minutes -->
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>StandardOutPath</key>
-    <string>/Users/user/__Repositories/LLMs-claude-code-exporter/logs/claude-sync.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/user/__Repositories/LLMs-claude-code-exporter/logs/claude-sync.error.log</string>
-</dict>
-</plist>
-```
-
-### Create sync-all.sh helper
-
-```bash
-#!/bin/bash
-# Sync all server-to-mac projects automatically
-
-cd "$(dirname "$0")"
-
-python3 sync.py list | grep "server-to-mac" | awk '{print $2}' | while read project; do
-    echo "Syncing $project..."
-    python3 sync.py pull "$project"
-done
-```
-
-```bash
-chmod +x sync-all.sh
-```
-
-### Load LaunchAgent
-
-```bash
-# Load agent
-launchctl load ~/Library/LaunchAgents/com.claude.sync.plist
-
-# Check status
-launchctl list | grep claude.sync
-
-# View logs
-tail -f ~/logs/claude-sync.log
-
-# Unload (stop)
-launchctl unload ~/Library/LaunchAgents/com.claude.sync.plist
-```
-
-## 🧪 How it Works
-
-```mermaid
-sequenceDiagram
-    participant Mac
-    participant Temp as /tmp/claude-sync
-    participant Server as eywa1
-
-    Note over Mac,Server: PULL (server → mac)
-    Mac->>Server: rsync pull .jsonl files
-    Server->>Temp: Copy to temp
-    Temp->>Temp: Transform paths<br/>/var/tmp → /private/var/folders
-    Temp->>Mac: Copy to ~/.claude/projects
-
-    Note over Mac,Server: PUSH (mac → server)
-    Mac->>Temp: Copy to temp
-    Temp->>Temp: Transform paths<br/>/private/var/folders → /var/tmp
-    Temp->>Server: rsync push to server
-```
-
-## 🔐 Security Model
-
-**Mac = Orchestrator** — все команды идут с мака:
-- ✅ Mac → Server (rsync with SSH key)
-- ✅ Server → Mac (rsync with SSH key)
-- ❌ Server НЕ имеет credentials для мака
-
-**Manual Approve for Push:**
-- `server-to-mac` проекты требуют подтверждения при push
-- Только `bidirectional` проекты могут автоматически sync в обе стороны
-
-## 📁 Path Transformation Examples
-
-| Server (Ubuntu) | macOS |
-|----------------|-------|
-| `/var/tmp/vibe-kanban-worktrees-vk-123/` | `/private/var/folders/dw/.../T/vibe-kanban-worktrees-vk-123/` |
-| `-var-tmp-vibe-kanban-...` | `-private-var-folders-dw-...-T-vibe-kanban-...` |
-| `/home/user/.claude/projects/` | `/Users/user/.claude/projects/` |
-
-## 🐛 Troubleshooting
-
-### Test fails with paths not matching
-
-Check your config.json paths - especially `temp_escaped` must exactly match Claude's project naming:
-
-```bash
-# List actual project names
-ls ~/.claude/projects/ | grep private-var
-
-# Update config to match
-```
-
-### rsync fails with permission denied
-
-Check SSH key authentication:
-
-```bash
-ssh -v eywa1 "ls ~/.claude/projects"
-```
-
-### Paths still wrong after sync
-
-Your config mappings might be incomplete. Add missing patterns to `paths` section.
-
-## 📚 Files
-
-| File | Purpose |
-|------|---------|
-| `config.json` | Your project mappings (gitignored) |
-| `config.example.json` | Example configuration |
-| `sync.py` | Main CLI tool |
-| `test_sample.jsonl` | QA test file |
-| `README.md` | This file |
-| `sync-all.sh` | Helper for auto-sync |
-
-## 🎨 Commands Reference
-
-```bash
-# Setup (first time)
-python3 src/sync.py setup
-
-# Discovery
-python3 src/sync.py scan server     # List server projects
-python3 src/sync.py scan local      # List local projects
-
-# Operations
-python3 src/sync.py list            # Show configured projects
-python3 src/sync.py pull <name>     # Pull from server
-python3 src/sync.py push <name>     # Push to server (with approval)
-```
-
-## 💡 Tips
-
-1. **First time:** Run `src/sync.py setup` - interactive wizard handles everything
-2. **Discovery:** Use `scan server`/`scan local` to see available projects
-3. **Add project:** Re-run `setup` or manually edit `config.json`
-4. **One-way sync:** Set `"sync": "server-to-mac"` for read-only projects
-5. **Debug:** Check `/tmp/claude-sync/` for transformed files
-6. **Logs:** Check `~/logs/claude-sync.log` for scheduled runs
+- `mode: pull` — тянем только с сервера.
+- `mode: push` — пушим только руками с мака.
+- `mode: both` — двунаправленный режим (push все равно вручную).
+- `rewrite_rules` — строки, которые нужно заменить в `.jsonl`. Чем длиннее совпадение, тем раньше оно применяется (правила сортируются автоматически).
 
 ---
 
-**Made for ADHD brains** 🧠⚡ by @developerisnow
+## 🧰 Команды
+
+```bash
+# Посмотреть список проектов и пути
+python3 src/sync.py list
+
+# Сервер → macOS
+python3 src/sync.py pull vibe-orchestrator
+
+# macOS → сервер (спросит подтверждение)
+python3 src/sync.py push memory-monorepo
+
+# Пройтись по всем pull/both проектам (используется планировщиком)
+python3 src/sync.py sync-all
+
+# Любую команду можно запустить с dry-run (прокинет флаг в rsync)
+python3 src/sync.py --dry-run pull vibe-orchestrator
+```
+
+---
+
+## ⏱ Планировщик (macOS LaunchAgent)
+
+1. Сделай скрипт исполняемым:
+
+   ```bash
+   chmod +x scripts/sync-all.sh
+   ```
+
+2. Создай `~/Library/LaunchAgents/com.claude.sync.plist` со следующим содержимым:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+       <key>Label</key>
+       <string>com.claude.sync</string>
+
+       <key>ProgramArguments</key>
+       <array>
+           <string>/Users/user/__Repositories/LLMs-claude-code-exporter/scripts/claude-code-sync/scripts/sync-all.sh</string>
+       </array>
+
+       <key>StartInterval</key>
+       <integer>300</integer> <!-- каждые 5 минут -->
+
+       <key>RunAtLoad</key>
+       <true/>
+
+       <key>StandardOutPath</key>
+       <string>/Users/user/__Repositories/LLMs-claude-code-exporter/logs/claude-sync.log</string>
+
+       <key>StandardErrorPath</key>
+       <string>/Users/user/__Repositories/LLMs-claude-code-exporter/logs/claude-sync.error.log</string>
+   </dict>
+   </plist>
+   ```
+
+3. Подними агент:
+
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.claude.sync.plist
+   launchctl list | grep claude.sync
+   ```
+
+4. Логи:
+
+   ```bash
+   tail -f ~/logs/claude-sync.log
+   ```
+
+Агент гоняет `sync-all` — он подтянет все `pull/both` проекты. `push` по Cron не запускаем ради безопасности.
+
+---
+
+## 🔄 Как переписываются пути
+
+| Что было (Ubuntu)                         | Что станет (macOS)                                        |
+|------------------------------------------|-----------------------------------------------------------|
+| `/home/user/.claude/projects/...`        | `/Users/user/.claude/projects/...`                        |
+| `/var/tmp/vibe-kanban-worktrees-...`     | `/private/var/folders/dw/.../T/vibe-kanban-worktrees-...` |
+| `-home-user---Repositories-`             | `-Users-user---Repositories-`                             |
+
+Правила можно расширять — просто добавляй новые элементы в `rewrite_rules`. Они применяются и при pull, и при push (во втором случае направления меняются на обратные).
+
+---
+
+## 🛠 Troubleshooting
+
+- **rsync говорит “command not found”** — установи `brew install rsync` (на macOS штатный уже есть).
+- **SSH не цепляется** — проверь `~/.ssh/config`, права на ключ и алиас.
+- **Файлы не переписались** — удостоверься, что правило замены точно совпадает со строкой (можно поискать `rg "var-tmp"` в `.jsonl`).
+- **Нужно проверить, что поменяется, но не писать** — используй `--dry-run`.
+
+---
+
+## 🔐 Модель работы
+- Все команды выполняет Mac.
+- Сервер никаких ключей от мака не имеет.
+- Push всегда требует ручного действия (или `--yes`, если понимаешь, что делаешь).
+
+---
+
+## 📁 Содержимое репозитория
+- `src/sync.py` — основной CLI.
+- `scripts/sync-all.sh` — обёртка для LaunchAgent.
+- `examples/config.example.json` — шаблон конфига.
+- `docs/` — история и заметки.
+- `files/` — примеры выгрузок (не используются кодом).

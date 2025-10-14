@@ -1,20 +1,13 @@
 #!/bin/bash
-# Sync all server-to-mac projects automatically
-# Used by LaunchAgent for scheduled sync
+# Wrapper executed by a LaunchAgent to pull every configured project.
 
-set -e
+set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 
-echo "[$(date)] Starting automatic sync..."
+echo "[$TIMESTAMP] claude-code-sync :: starting pull cycle"
 
-# Get list of projects with server-to-mac sync mode
-python3 sync.py list | grep -E "\[server-to-mac\]|\[bidirectional\]" | awk '{print $2}' | while read -r project; do
-    if [ -n "$project" ]; then
-        echo "  → Syncing $project..."
-        python3 sync.py pull "$project" 2>&1
-    fi
-done
+python3 "${REPO_ROOT}/src/sync.py" sync-all "$@"
 
-echo "[$(date)] Sync completed"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] claude-code-sync :: done"

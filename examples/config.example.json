@@ -1,31 +1,38 @@
 {
   "ssh_alias": "eywa1",
   "paths": {
-    "server": {
-      "claude_projects": "/home/user/.claude/projects",
-      "temp_base": "/var/tmp",
-      "temp_escaped": "-var-tmp"
-    },
-    "macos": {
-      "claude_projects": "/Users/user/.claude/projects",
-      "temp_base": "/private/var/folders/dw/d6symylx7sz0b30vzcrfkdg80000gq/T",
-      "temp_escaped": "-private-var-folders-dw-d6symylx7sz0b30vzcrfkdg80000gq-T"
-    }
+    "macos_root": "/Users/user/.claude/projects",
+    "server_root": "/home/user/.claude/projects"
   },
+  "rewrite_rules": [
+    {
+      "description": "Claude projects directory root",
+      "server": "/home/user/.claude/projects",
+      "mac": "/Users/user/.claude/projects"
+    },
+    {
+      "description": "Claude temp directories naming",
+      "server": "-var-tmp",
+      "mac": "-private-var-folders-dw-d6symylx7sz0b30vzcrfkdg80000gq-T"
+    },
+    {
+      "description": "Repositories prefix naming",
+      "server": "-home-user---Repositories-",
+      "mac": "-Users-user---Repositories-"
+    }
+  ],
   "projects": [
     {
       "name": "vibe-orchestrator",
       "server_dir": "-var-tmp-vibe-kanban-worktrees-vk-2bd7-run-orch-n",
       "macos_dir": "-private-var-folders-dw-d6symylx7sz0b30vzcrfkdg80000gq-T-vibe-kanban-worktrees-vk-2bd7-run-orch-n",
-      "sync": "server-to-mac",
-      "enabled": true
+      "mode": "pull"
     },
     {
       "name": "memory-monorepo",
       "server_dir": "-home-user---Repositories-memory-monorepo",
       "macos_dir": "-Users-user---Repositories-LLMs-memory--developerisnow",
-      "sync": "bidirectional",
-      "enabled": true
+      "mode": "both"
     }
   ]
 }
