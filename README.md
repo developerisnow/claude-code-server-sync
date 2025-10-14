@@ -29,11 +29,25 @@ Host eywa1
     IdentityFile ~/.ssh/id_rsa
 ```
 
-### 2️⃣ Configure Projects
+### 2️⃣ Interactive Setup (Recommended)
+
+```bash
+# Run setup wizard
+python3 src/sync.py setup
+
+# This will:
+# 1. Test SSH connection
+# 2. Scan server projects
+# 3. Scan local projects
+# 4. Interactive matching
+# 5. Create config.json
+```
+
+### 2️⃣ Alternative: Manual Config
 
 ```bash
 # Copy example config
-cp config.example.json config.json
+cp examples/config.example.json config.json
 
 # Edit mappings
 vim config.json
@@ -68,25 +82,25 @@ vim config.json
 }
 ```
 
-### 3️⃣ Test Transformation
-
-```bash
-python3 sync.py test
-```
-
-Должен пройти roundtrip test ✅
-
-### 4️⃣ Manual Sync
+### 3️⃣ Verify Setup
 
 ```bash
 # List configured projects
-python3 sync.py list
+python3 src/sync.py list
 
+# Scan available projects anytime
+python3 src/sync.py scan server
+python3 src/sync.py scan local
+```
+
+### 4️⃣ Sync Operations
+
+```bash
 # Pull from server
-python3 sync.py pull vibe-orchestrator
+python3 src/sync.py pull vibe-orchestrator
 
 # Push to server (asks confirmation)
-python3 sync.py push memory-monorepo
+python3 src/sync.py push memory-monorepo
 ```
 
 ## 🤖 Automatic Sync (macOS LaunchAgent)
@@ -236,26 +250,27 @@ Your config mappings might be incomplete. Add missing patterns to `paths` sectio
 ## 🎨 Commands Reference
 
 ```bash
-# Test transformation
-python3 sync.py test
+# Setup (first time)
+python3 src/sync.py setup
 
-# List projects
-python3 sync.py list
+# Discovery
+python3 src/sync.py scan server     # List server projects
+python3 src/sync.py scan local      # List local projects
 
-# Pull from server
-python3 sync.py pull <project-name>
-
-# Push to server (with approval)
-python3 sync.py push <project-name>
+# Operations
+python3 src/sync.py list            # Show configured projects
+python3 src/sync.py pull <name>     # Pull from server
+python3 src/sync.py push <name>     # Push to server (with approval)
 ```
 
 ## 💡 Tips
 
-1. **First sync:** Always run `sync.py test` first to verify transformations
-2. **Add new project:** Update `config.json`, run `sync.py list` to verify
-3. **One-way sync:** Set `"sync": "server-to-mac"` for read-only projects
-4. **Debug:** Check `/tmp/claude-sync/` for transformed files
-5. **Logs:** Check `~/logs/claude-sync.log` for scheduled runs
+1. **First time:** Run `src/sync.py setup` - interactive wizard handles everything
+2. **Discovery:** Use `scan server`/`scan local` to see available projects
+3. **Add project:** Re-run `setup` or manually edit `config.json`
+4. **One-way sync:** Set `"sync": "server-to-mac"` for read-only projects
+5. **Debug:** Check `/tmp/claude-sync/` for transformed files
+6. **Logs:** Check `~/logs/claude-sync.log` for scheduled runs
 
 ---
 
